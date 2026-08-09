@@ -17,9 +17,9 @@
     "auto-pi": "bin/auto-pi.js"
   },
   "files": [
-    "extensions",
-    "python",
-    "bin",
+    "extensions/*.ts",
+    "python/*.py",
+    "bin/*.js",
     "README.md",
     "LICENSE"
   ],
