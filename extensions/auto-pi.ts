@@ -25,6 +25,10 @@ const CONFIG_PATH = join(HOME_DIR, "config.json");
 const VENV_PYTHON = join(HOME_DIR, "venv", "bin", "python3");
 const SERVER_PY = join(PKG_ROOT, "python", "auto_server.py");
 
+// Measured on this model family's own corpus. Used to turn the scorer's token window into a
+// character budget; slight overshoot is harmless because the tokenizer truncates the tail.
+const CHARS_PER_TOKEN = 2.75;
+
 const MODELS: Record<string, string> = {
 	"auto-1b": "ProCreations/auto-1b-bf16",
 	"auto-1b-bf16": "ProCreations/auto-1b-bf16",
@@ -54,6 +58,8 @@ const DEFAULTS: Config = {
 	failClosed: false,
 	maxHistorySteps: 20,
 	maxResultChars: 2000,
+	// Ceiling only. The effective limit is the scorer's real window (small without
+	// flash-attn), so this rarely binds — it exists to stop a pathological transcript.
 	maxInputChars: 120000,
 	exemptTools: [],
 	notifyOnApprove: false,
@@ -164,6 +170,7 @@ function buildModelInput(
 	userRequest: string,
 	steps: HistoryStep[],
 	cfg: Config,
+	charBudget: number,
 ): string {
 	const parts = [
 		"### PROPOSED TOOL CALL",
@@ -176,26 +183,40 @@ function buildModelInput(
 		"### AGENT HISTORY",
 	];
 
+	const limit = Math.max(1000, Math.min(cfg.maxInputChars, charBudget));
+	const header = parts.join("\n");
 	const recent = steps.slice(-Math.max(0, cfg.maxHistorySteps));
+
 	if (recent.length === 0) {
-		parts.push("(no prior actions)");
-	} else {
-		recent.forEach((s, i) => {
-			let result = s.result ?? "";
-			if (result.length > cfg.maxResultChars) {
-				result = `${result.slice(0, cfg.maxResultChars)}… [truncated]`;
-			}
-			parts.push(`[${i + 1}] ${s.tool}(${s.args})\n-> ${result}`);
-		});
+		return `${header}\n(no prior actions)`;
 	}
 
-	let text = parts.join("\n");
-	if (text.length > cfg.maxInputChars) {
-		// Trim the tail (oldest history is at the end of the section) rather than the head,
-		// so the call and the request always survive.
-		text = `${text.slice(0, cfg.maxInputChars)}\n… [history truncated]`;
+	// Fill the budget from the MOST RECENT step backwards. The steps nearest the proposed call
+	// are the ones that authorise or condemn it, so when space runs out the oldest must go —
+	// truncating the rendered string instead would silently delete the newest and most
+	// relevant history, which is exactly backwards.
+	const rendered: string[] = [];
+	let used = header.length;
+	let dropped = 0;
+	for (let i = recent.length - 1; i >= 0; i--) {
+		const s = recent[i];
+		let result = s.result ?? "";
+		if (result.length > cfg.maxResultChars) {
+			result = `${result.slice(0, cfg.maxResultChars)}… [truncated]`;
+		}
+		const line = `${s.tool}(${s.args})\n-> ${result}`;
+		if (used + line.length + 8 > limit && rendered.length > 0) {
+			dropped = i + 1;
+			break;
+		}
+		used += line.length + 8;
+		rendered.push(line);
 	}
-	return text;
+	rendered.reverse();
+
+	const body = rendered.map((line, i) => `[${i + 1}] ${line}`).join("\n");
+	const note = dropped > 0 ? `(… ${dropped} earlier step${dropped === 1 ? "" : "s"} omitted)\n` : "";
+	return `${header}\n${note}${body}`;
 }
 
 /** Owns the python sidecar: lazy spawn, request multiplexing, restart on death. */
@@ -413,10 +434,16 @@ export default function (pi: ExtensionAPI) {
 
 		const call = { tool: String(event.toolName), args: renderArgs(event.input) };
 		const { userRequest, steps } = readSession(ctx, String(event.toolCallId ?? ""));
-		const text = buildModelInput(call, userRequest, steps, cfg);
 
 		let pDeny: number;
 		try {
+			// Size the input to the window the scorer actually has. Without flash-attn that
+			// window is small on purpose (attention memory is quadratic), and building a
+			// 100k-char prompt only to have it truncated wastes work and hides the real limit.
+			await scorer.start();
+			const tokenBudget = Number(scorer.info?.max_len) || 2048;
+			const charBudget = Math.floor(tokenBudget * CHARS_PER_TOKEN);
+			const text = buildModelInput(call, userRequest, steps, cfg, charBudget);
 			const out = await scorer.score(text);
 			pDeny = out.p_deny;
 		} catch (err: any) {

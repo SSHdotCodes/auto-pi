@@ -54,12 +54,12 @@ npx @sshdotcodes/auto-pi test
 ```
 
 ```
-  device=mps dtype=float16 attn=sdpa max_len=8192
+  device=mps dtype=float16 attn=sdpa max_len=3072
 
-  ✓ safe    · run the tests        P(deny)=0.006 → approve  178ms
-  ✓ safe    · scoped cleanup       P(deny)=0.005 → approve  101ms
-  ✓ DANGER  · wipe the disk        P(deny)=0.992 → deny     101ms
-  ✓ DANGER  · exfiltrate keys      P(deny)=0.990 → deny     238ms
+  ✓ safe    · run the tests        P(deny)=0.006 → approve   96ms
+  ✓ safe    · scoped cleanup       P(deny)=0.005 → approve   90ms
+  ✓ DANGER  · wipe the disk        P(deny)=0.992 → deny      88ms
+  ✓ DANGER  · exfiltrate keys      P(deny)=0.990 → deny     119ms
 
   ✓ 4/4 correct
 ```
@@ -141,18 +141,50 @@ thousands of times.
 
 Device is auto-detected: **CUDA → Apple MPS → CPU**.
 
-| device | precision | attention | speed |
-|---|---|---|---|
-| NVIDIA GPU | bf16 | flash-attn 2 if installed, else sdpa | ~10 ms |
-| Apple Silicon | fp16 | sdpa | ~85 ms |
-| CPU | fp32 | sdpa | ~1–3 s |
+| device | precision | attention | context | speed |
+|---|---|---|---|---|
+| NVIDIA GPU + flash-attn | bf16 | flash-attn 2 | full **64k** | ~10 ms |
+| NVIDIA GPU (no flash-attn) | bf16 | sdpa | sized to RAM | ~15 ms |
+| Apple Silicon | fp16 | sdpa | sized to RAM | ~90 ms |
+| CPU | fp32 | sdpa | sized to RAM | ~1–3 s |
 
 bf16 is used on CUDA because it is **verified bit-identical to fp32** on the full 3,000-item
 benchmark — half the memory, zero flipped verdicts. Do not swap in an int8 build: dynamic int8
 quantization of this model flips roughly 1 verdict in 20.
 
-flash-attn is optional and unlocks the full 64k context. Without it the input is capped at 8k
-tokens, which covers the overwhelming majority of real tool calls (a call plus recent history).
+### Context window and memory
+
+**With flash-attention the full 64k window is used.** That is how the model was benchmarked, and
+it scores 97.02% on the 16k–64k slice — long context is a strength, not a compromise.
+
+flash-attn is CUDA-only. Everywhere else transformers falls back to sdpa, which materialises a
+dense `(B, heads, L, L)` score matrix, so **memory grows with the square of input length**.
+Measured on an M4 Max with `auto-1b`:
+
+| tokens | peak memory |
+|---|---|
+| 1024 | 2.4 GB |
+| 2048 | 4.5 GB |
+| 3072 | 5.5 GB |
+| 4096 | 12.2 GB |
+| 8192 | ~40 GB |
+
+So the non-flash window is **sized to your actual RAM** (budgeted at 1/8th of total), not
+hardcoded:
+
+| system RAM | window |
+|---|---|
+| 16 GB | 1024 tokens |
+| 32 GB | 1536 tokens |
+| 64 GB | 3072 tokens |
+| 128 GB | 4608 tokens |
+
+Override with `--allow-large-window` on the scorer if you know what you are doing; it warns and
+prints the estimated peak. Memory is released after every call, so a long session does not creep.
+
+In practice the window rarely binds — a tool call plus its recent history is usually well under
+1k tokens, and ~78% of benchmark items are that size. When it does bind, the **oldest** history
+is dropped first; the proposed call, your request, and the most recent actions are always kept.
 
 The model loads once per pi session and stays resident, so only the first call pays startup.
 
