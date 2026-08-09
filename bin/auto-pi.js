@@ -2,10 +2,10 @@
 /**
  * auto-pi installer / doctor.
  *
- *   npx auto-pi install [auto-1b|auto-0.4b]   set up the venv + download the model
- *   npx auto-pi test                          score a known-safe and known-dangerous call
- *   npx auto-pi info                          show device, dtype, attention backend
- *   npx auto-pi uninstall                     remove the venv (leaves the HF cache)
+ *   npx @sshdotcodes/auto-pi install [auto-1b|auto-0.4b]   set up the venv + download the model
+ *   npx @sshdotcodes/auto-pi test                          score a known-safe and known-dangerous call
+ *   npx @sshdotcodes/auto-pi info                          show device, dtype, attention backend
+ *   npx @sshdotcodes/auto-pi uninstall                     remove the venv (leaves the HF cache)
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -124,7 +124,7 @@ async function install(which) {
 
 	console.log(c.green("\n✓ installed"));
 	await smoke(model);
-	console.log(`\nEnable in pi:  ${c.bold("pi install npm:auto-pi")}`);
+	console.log(`\nEnable in pi:  ${c.bold("pi install npm:@sshdotcodes/auto-pi")}`);
 	console.log(`Then inside pi: ${c.bold("/auto status")}\n`);
 }
 
@@ -252,11 +252,11 @@ switch (cmd) {
 		console.log(`
 ${c.bold("auto-pi")} — automatic tool-call review for pi
 
-  ${c.bold("npx auto-pi install")} [auto-1b|auto-0.4b]   set up venv + download model
-  ${c.bold("npx auto-pi test")}    [model]               score known safe/dangerous calls
-  ${c.bold("npx auto-pi info")}    [model]               show device / dtype / attention
-  ${c.bold("npx auto-pi uninstall")}                     remove the venv
+  ${c.bold("npx @sshdotcodes/auto-pi install")} [auto-1b|auto-0.4b]   set up venv + download model
+  ${c.bold("npx @sshdotcodes/auto-pi test")}    [model]               score known safe/dangerous calls
+  ${c.bold("npx @sshdotcodes/auto-pi info")}    [model]               show device / dtype / attention
+  ${c.bold("npx @sshdotcodes/auto-pi uninstall")}                     remove the venv
 
-Then: ${c.bold("pi install npm:auto-pi")}  and inside pi, ${c.bold("/auto status")}
+Then: ${c.bold("pi install npm:@sshdotcodes/auto-pi")}  and inside pi, ${c.bold("/auto status")}
 `);
 }

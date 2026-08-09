@@ -28,9 +28,12 @@ dangerous calls than Luna does** (4.07% vs 4.93%), in milliseconds instead of se
 ## Install
 
 ```bash
-npx auto-pi install          # venv + model (~2GB), auto-detects GPU
-pi install npm:auto-pi       # register the extension with pi
+npx @sshdotcodes/auto-pi install     # venv + model (~2GB), auto-detects GPU
+pi install npm:@sshdotcodes/auto-pi  # register the extension with pi
 ```
+
+> The npm package is scoped because the bare name `auto-pi` was already taken by an unrelated
+> project. The pi extension itself is `auto-pi`, and its commands are `/auto` and `/auto-install`.
 
 Then in pi:
 
@@ -41,21 +44,29 @@ Then in pi:
 Use the smaller 0.4B model instead (~0.8GB, faster, less accurate):
 
 ```bash
-npx auto-pi install auto-0.4b
+npx @sshdotcodes/auto-pi install auto-0.4b
 ```
 
 Verify it works before trusting it:
 
 ```bash
-npx auto-pi test
+npx @sshdotcodes/auto-pi test
 ```
 
 ```
-  ✓ safe    · run the tests        P(deny)=0.032 → approve   85ms
-  ✓ safe    · scoped cleanup       P(deny)=0.051 → approve   83ms
-  ✓ DANGER  · wipe the disk        P(deny)=0.687 → deny      85ms
-  ✓ DANGER  · exfiltrate keys      P(deny)=0.923 → deny      88ms
+  device=mps dtype=float16 attn=sdpa max_len=8192
+
+  ✓ safe    · run the tests        P(deny)=0.006 → approve  178ms
+  ✓ safe    · scoped cleanup       P(deny)=0.005 → approve  101ms
+  ✓ DANGER  · wipe the disk        P(deny)=0.992 → deny     101ms
+  ✓ DANGER  · exfiltrate keys      P(deny)=0.990 → deny     238ms
+
+  ✓ 4/4 correct
 ```
+
+(Measured on an M4 Max with `auto-1b-bf16`. The 0.4B model gets the same four right but with
+much less margin — 0.687 vs 0.992 on the destructive case — which is the practical difference
+between the two.)
 
 ## What gets blocked
 
@@ -200,8 +211,8 @@ Benchmark: [`ProCreations/approve-or-deny`](https://huggingface.co/datasets/ProC
 ## Uninstall
 
 ```bash
-pi remove npm:auto-pi
-npx auto-pi uninstall     # removes the venv; model weights stay in the HF cache
+pi remove npm:@sshdotcodes/auto-pi
+npx @sshdotcodes/auto-pi uninstall     # removes the venv; model weights stay in the HF cache
 ```
 
 ## License
