@@ -1,6 +1,6 @@
 {
   "name": "@sshdotcodes/auto-pi",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Automatic tool-call review for pi \u2014 a local encoder approves safe tool calls and blocks dangerous ones before they run",
   "type": "module",
   "license": "Apache-2.0",

@@ -11,6 +11,8 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import httpMod from "node:http";
+import httpsMod from "node:https";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -37,6 +39,9 @@ const MODELS: Record<string, string> = {
 
 type Config = {
 	enabled: boolean;
+	backend: "local" | "remote";
+	endpoint: string;
+	remoteTimeoutMs: number;
 	model: string;
 	threshold: number;
 	device: string;
@@ -46,10 +51,17 @@ type Config = {
 	maxInputChars: number;
 	exemptTools: string[];
 	notifyOnApprove: boolean;
+	acknowledgedRemotePrivacy: boolean;
 };
 
 const DEFAULTS: Config = {
 	enabled: true,
+	// Local by default. Remote is a deliberate opt-in because it sends your prompts, tool
+	// arguments and command output off the machine — see the privacy note in /auto backend.
+	backend: "local",
+	endpoint: "https://auto.ssh.codes",
+	remoteTimeoutMs: 15000,
+	acknowledgedRemotePrivacy: false,
 	model: "ProCreations/auto-1b-bf16",
 	threshold: 0.5,
 	device: "auto",
@@ -420,13 +432,157 @@ class Scorer {
 	}
 }
 
+/**
+ * Minimal JSON-over-HTTPS request built on node:https.
+ *
+ * Deliberately not `fetch`: inside pi's extension runtime a fetch has been observed to neither
+ * resolve nor reject, and `AbortSignal.timeout` did not rescue it, which wedges the agent
+ * because the tool_call handler is awaited. node:https gives an explicit socket timeout plus a
+ * hard wall-clock guard that we own. A gate may fail; it must never hang.
+ */
+function httpJson(
+	urlStr: string,
+	timeoutMs: number,
+	body?: unknown,
+): Promise<{ status: number; json: any }> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const done = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(guard);
+			fn();
+		};
+		const guard = setTimeout(
+			() => done(() => reject(new Error(`request to ${urlStr} timed out after ${timeoutMs}ms`))),
+			timeoutMs,
+		);
+
+		let url: URL;
+		try {
+			url = new URL(urlStr);
+		} catch (err: any) {
+			done(() => reject(new Error(`bad endpoint ${urlStr}: ${err?.message ?? err}`)));
+			return;
+		}
+		const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+		const mod = url.protocol === "http:" ? httpMod : httpsMod;
+		const req = mod.request(
+			{
+				hostname: url.hostname,
+				port: url.port || (url.protocol === "http:" ? 80 : 443),
+				path: `${url.pathname}${url.search}`,
+				method: payload ? "POST" : "GET",
+				headers: payload
+					? { "Content-Type": "application/json", "Content-Length": String(payload.length) }
+					: {},
+				timeout: timeoutMs,
+			},
+			(res: any) => {
+				const chunks: Buffer[] = [];
+				res.on("data", (c: Buffer) => chunks.push(c));
+				res.on("end", () =>
+					done(() => {
+						const raw = Buffer.concat(chunks).toString("utf8");
+						try {
+							resolve({ status: res.statusCode ?? 0, json: raw ? JSON.parse(raw) : null });
+						} catch (err: any) {
+							reject(new Error(`bad JSON from ${urlStr}: ${err?.message ?? err}`));
+						}
+					}),
+				);
+				res.on("error", (err: any) => done(() => reject(err)));
+			},
+		);
+		req.on("timeout", () => {
+			req.destroy(new Error(`socket timeout after ${timeoutMs}ms`));
+		});
+		req.on("error", (err: any) => done(() => reject(err)));
+		if (payload) req.write(payload);
+		req.end();
+	});
+}
+
+/**
+ * Hosted scorer. Same interface as the local Scorer so the gate does not care which is in use.
+ *
+ * The hosted model runs on CUDA with the full 64k window, so unlike the local sdpa path there
+ * is no need to shrink the input — long sessions are judged with their history intact.
+ */
+class RemoteScorer {
+	info: any = null;
+	lastError: string | null = null;
+	private probing: Promise<void> | null = null;
+
+	constructor(private cfg: Config) {}
+
+	isRunning(): boolean {
+		return this.info !== null;
+	}
+
+	async start(): Promise<void> {
+		if (this.info) return;
+		if (this.probing) return this.probing;
+		this.probing = (async () => {
+			const url = `${this.cfg.endpoint.replace(/\/+$/, "")}/health`;
+			try {
+				const { status, json: h } = await httpJson(url, this.cfg.remoteTimeoutMs);
+				if (status !== 200) throw new Error(`health ${status}`);
+				if (h?.status && h.status !== "ready") throw new Error(`service ${h.status}`);
+				this.info = {
+					device: "remote",
+					dtype: h?.dtype ?? "?",
+					attn: h?.attention ?? "?",
+					max_len: Number(h?.max_tokens) || 65536,
+					model: h?.model ?? "remote",
+					endpoint: this.cfg.endpoint,
+				};
+				this.lastError = null;
+			} catch (err: any) {
+				this.lastError = `${this.cfg.endpoint}: ${err?.message ?? err}`;
+				throw new Error(this.lastError);
+			}
+		})().finally(() => {
+			this.probing = null;
+		});
+		return this.probing;
+	}
+
+	async score(text: string): Promise<{ p_deny: number; ms: number; tokens: number }> {
+		const url = `${this.cfg.endpoint.replace(/\/+$/, "")}/v1/classify`;
+		let status: number;
+		let j: any;
+		try {
+			({ status, json: j } = await httpJson(url, this.cfg.remoteTimeoutMs, { text }));
+		} catch (err: any) {
+			// A dead network must never be mistaken for a verdict.
+			this.info = null;
+			throw new Error(`remote scorer unreachable: ${err?.message ?? err}`);
+		}
+		if (status !== 200) throw new Error(`remote scorer returned HTTP ${status}`);
+		const p = Number(j?.p_deny);
+		if (!Number.isFinite(p)) throw new Error("remote scorer returned no p_deny");
+		return { p_deny: p, ms: Number(j?.total_ms) || 0, tokens: Number(j?.token_count) || 0 };
+	}
+
+	stop(): void {
+		this.info = null;
+	}
+}
+
+function makeScorer(cfg: Config): any {
+	return cfg.backend === "remote" ? new RemoteScorer(cfg) : new Scorer(cfg);
+}
+
 export default function (pi: ExtensionAPI) {
 	let cfg = loadConfig();
-	let scorer = new Scorer(cfg);
+	let scorer: any = makeScorer(cfg);
 	let warnedUnavailable = false;
 	const stats = { approved: 0, blocked: 0, errors: 0 };
 
-	const modelShortName = () => cfg.model.replace(/^ProCreations\//, "");
+	const modelShortName = () =>
+		(cfg.backend === "remote" ? String(scorer.info?.model ?? "auto-1b") : cfg.model)
+			.replace(/^ProCreations\//, "");
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		if (!cfg.enabled) return undefined;
@@ -462,8 +618,12 @@ export default function (pi: ExtensionAPI) {
 			if (!warnedUnavailable) {
 				warnedUnavailable = true;
 				ctx.ui?.notify?.(
-					`auto-pi: review unavailable (${why}). Tool calls are running UNREVIEWED. ` +
-						`Run /auto-install to fix, or /auto off to silence this.`,
+					`auto-pi: review unavailable (${why}). Tool calls are running UNREVIEWED.\n` +
+						(cfg.backend === "local"
+							? `Fix with: /auto backend remote  (hosted, no download, no API key)\n` +
+								`      or: npx @sshdotcodes/auto-pi install  (run it locally)\n`
+							: `Check your connection, or /auto backend local to run it on this machine.\n`) +
+						`Silence with /auto off.`,
 					"warning",
 				);
 			}
@@ -480,7 +640,8 @@ export default function (pi: ExtensionAPI) {
 				block: true,
 				reason:
 					`BLOCKED BY THE AUTOMATIC TOOL CALL REVIEW MODEL (auto-pi).\n\n` +
-					`This tool call was not executed. A local safety classifier (${modelShortName()}) ` +
+					`This tool call was not executed. A safety classifier (${modelShortName()}, ` +
+					`${cfg.backend}) ` +
 					`reviewed it against the user's request and your recent actions, and judged it ` +
 					`unsafe to run without human approval — confidence ${pct}%.\n\n` +
 					`This is an automated review, not the user speaking, and it can be wrong.\n\n` +
@@ -508,7 +669,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("auto", {
 		description: "Automatic tool-call review: status, on/off, model, threshold",
 		getArgumentCompletions: (prefix: string) => {
-			const opts = ["status", "on", "off", "model", "threshold", "device", "fail-closed", "stats"];
+			const opts = ["status", "on", "off", "backend", "model", "threshold", "device", "fail-closed", "stats"];
 			const items = opts.filter((o) => o.startsWith(prefix)).map((o) => ({ value: o, label: o }));
 			return items.length ? items : null;
 		},
@@ -523,7 +684,9 @@ export default function (pi: ExtensionAPI) {
 					const info = scorer.info;
 					const lines = [
 						`auto-pi ${cfg.enabled ? "ENABLED" : "disabled"}`,
-						`model:     ${cfg.model}`,
+						`backend:   ${cfg.backend}${cfg.backend === "remote" ? ` (${cfg.endpoint})` : ""}`,
+						`model:     ${cfg.backend === "remote" ? (scorer.info?.model ?? "—") : cfg.model}`,
+						`context:   ${scorer.info?.max_len ? `${scorer.info.max_len} tokens` : "—"}`,
 						`threshold: ${cfg.threshold} (block when P(deny) > this)`,
 						`scorer:    ${running ? `running on ${info?.device ?? "?"} (${info?.dtype ?? "?"}, ${info?.attn ?? "?"})` : "not started"}`,
 						`on error:  ${cfg.failClosed ? "fail closed (block)" : "fail open (allow + warn)"}`,
@@ -549,6 +712,60 @@ export default function (pi: ExtensionAPI) {
 						"info",
 					);
 					return;
+				case "backend": {
+					if (!value) {
+						ctx.ui?.notify?.(
+							`backend: ${cfg.backend}\n` +
+								`  local  — runs the model on this machine, nothing leaves it\n` +
+								`  remote — ${cfg.endpoint} (free, no API key, full 64k context)\n` +
+								`switch with: /auto backend local | /auto backend remote`,
+							"info",
+						);
+						return;
+					}
+					if (value !== "local" && value !== "remote") {
+						ctx.ui?.notify?.("usage: /auto backend local|remote", "error");
+						return;
+					}
+					if (value === "remote" && !cfg.acknowledgedRemotePrivacy) {
+						// Sending an agent transcript off-machine is a real decision. Make it once,
+						// explicitly, rather than burying it in a config file nobody reads.
+						const ok = ctx.hasUI
+							? await ctx.ui.select(
+									`Use the hosted reviewer at ${cfg.endpoint}?\n\n` +
+										`Each reviewed tool call sends the command and its arguments,\n` +
+										`your originating request, and recent tool output to that server.\n` +
+										`That can include file contents, paths and secrets that appear in\n` +
+										`command output. Nothing is sent while the backend is "local".\n\n` +
+										`In exchange: no 2GB download, no local GPU use, and the full 64k\n` +
+										`context window instead of a RAM-limited one.`,
+									["Use hosted reviewer", "Cancel"],
+								)
+							: "Cancel";
+						if (ok !== "Use hosted reviewer") {
+							ctx.ui?.notify?.("kept backend: local", "info");
+							return;
+						}
+						cfg.acknowledgedRemotePrivacy = true;
+					}
+					cfg.backend = value;
+					saveConfig(cfg);
+					scorer.stop();
+					scorer = makeScorer(cfg);
+					try {
+						await scorer.start();
+						const i = scorer.info;
+						ctx.ui?.notify?.(
+							value === "remote"
+								? `backend: remote — ${i?.model ?? "auto"} @ ${cfg.endpoint}, ${i?.max_len ?? "?"} token context`
+								: `backend: local — ${cfg.model} on ${i?.device ?? "?"}`,
+							"info",
+						);
+					} catch (err: any) {
+						ctx.ui?.notify?.(`backend set to ${value}, but it is not reachable: ${err?.message ?? err}`, "warning");
+					}
+					return;
+				}
 				case "model": {
 					if (!value) {
 						ctx.ui?.notify?.(`model: ${cfg.model}\nchoices: ${Object.keys(MODELS).join(", ")}`, "info");
@@ -558,7 +775,7 @@ export default function (pi: ExtensionAPI) {
 					cfg.model = resolved;
 					saveConfig(cfg);
 					scorer.stop();
-					scorer = new Scorer(cfg);
+					scorer = makeScorer(cfg);
 					ctx.ui?.notify?.(`auto-pi model set to ${resolved} (restart on next call)`, "info");
 					return;
 				}
@@ -584,7 +801,7 @@ export default function (pi: ExtensionAPI) {
 					cfg.device = value;
 					saveConfig(cfg);
 					scorer.stop();
-					scorer = new Scorer(cfg);
+					scorer = makeScorer(cfg);
 					ctx.ui?.notify?.(`device set to ${value}`, "info");
 					return;
 				}
@@ -601,7 +818,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				default:
 					ctx.ui?.notify?.(
-						"usage: /auto [status|on|off|stats|model <name>|threshold <0-1>|device <d>|fail-closed <bool>]",
+						"usage: /auto [status|on|off|stats|backend local|remote|model <name>|threshold <0-1>|device <d>|fail-closed <bool>]",
 						"info",
 					);
 			}
