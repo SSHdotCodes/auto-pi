@@ -1,0 +1,47 @@
+{
+  "name": "auto-pi",
+  "version": "1.0.0",
+  "description": "Automatic tool-call review for pi — a local encoder approves safe tool calls and blocks dangerous ones before they run",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "SSHdotCodes",
+  "homepage": "https://github.com/SSHdotCodes/auto-pi#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SSHdotCodes/auto-pi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SSHdotCodes/auto-pi/issues"
+  },
+  "bin": {
+    "auto-pi": "bin/auto-pi.js"
+  },
+  "files": [
+    "extensions",
+    "python",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "agent-safety",
+    "tool-calling",
+    "guardrails",
+    "ai-safety",
+    "auto-approve"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
